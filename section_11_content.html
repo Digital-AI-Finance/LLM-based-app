@@ -1,0 +1,553 @@
+        <!-- Section 11: Cost Optimization -->
+        <section class="section" id="cost-optimization">
+          <h2>11. Cost Optimization</h2>
+
+          <p>Cost optimization is critical for sustainable LLM application operations. With API costs ranging from $0.50 to $150 per million tokens, unoptimized applications can quickly become prohibitively expensive. This section provides comprehensive strategies for reducing costs while maintaining quality and performance.</p>
+
+          <article class="subsection" id="token-optimization">
+            <h3>11.1 Token Optimization</h3>
+
+            <p>Token optimization is the cornerstone of LLM cost management. Since API costs are directly proportional to token consumption, reducing token usage without compromising functionality can lead to dramatic cost savings. This section explores production-tested strategies for minimizing token usage across input prompts and output responses.</p>
+
+            <h4>Prompt Compression Techniques</h4>
+
+            <p>Prompt compression reduces token count while preserving semantic meaning. Advanced techniques include context distillation, where lengthy context is summarized into essential information, and semantic compression, which removes redundant or low-value information.</p>
+
+            <pre><code class="language-python line-numbers">from typing import List, Dict, Any
+import tiktoken
+from transformers import AutoTokenizer, AutoModel
+import torch
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+
+class PromptCompressor:
+    """
+    Advanced prompt compression with multiple strategies.
+    Reduces token count while preserving semantic meaning.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "gpt-4",
+        compression_ratio: float = 0.5,
+        use_semantic_compression: bool = True
+    ):
+        self.model_name = model_name
+        self.compression_ratio = compression_ratio
+        self.use_semantic_compression = use_semantic_compression
+
+        # Initialize tokenizer for accurate token counting
+        self.tokenizer = tiktoken.encoding_for_model(model_name)
+
+        # Initialize embeddings model for semantic compression
+        if use_semantic_compression:
+            self.embeddings_model = AutoModel.from_pretrained(
+                "sentence-transformers/all-MiniLM-L6-v2"
+            )
+            self.embeddings_tokenizer = AutoTokenizer.from_pretrained(
+                "sentence-transformers/all-MiniLM-L6-v2"
+            )
+
+    def count_tokens(self, text: str) -> int:
+        """Count tokens using model-specific tokenizer."""
+        return len(self.tokenizer.encode(text))
+
+    def compress_context(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int
+    ) -> List[Dict[str, str]]:
+        """
+        Compress conversation context to fit within token budget.
+        Uses multiple strategies based on configuration.
+        """
+        current_tokens = sum(
+            self.count_tokens(msg["content"])
+            for msg in messages
+        )
+
+        if current_tokens <= max_tokens:
+            return messages
+
+        # Strategy 1: Keep system message and recent messages
+        if not self.use_semantic_compression:
+            return self._compress_by_recency(messages, max_tokens)
+
+        # Strategy 2: Semantic compression
+        return self._compress_semantically(messages, max_tokens)
+
+    def _compress_by_recency(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int
+    ) -> List[Dict[str, str]]:
+        """
+        Simple compression: Keep system message + recent messages.
+        """
+        # Always keep system message
+        system_msgs = [m for m in messages if m["role"] == "system"]
+        other_msgs = [m for m in messages if m["role"] != "system"]
+
+        # Add messages from newest to oldest until budget exhausted
+        compressed = system_msgs.copy()
+        remaining_tokens = max_tokens - sum(
+            self.count_tokens(m["content"]) for m in system_msgs
+        )
+
+        for msg in reversed(other_msgs):
+            msg_tokens = self.count_tokens(msg["content"])
+            if msg_tokens <= remaining_tokens:
+                compressed.insert(len(system_msgs), msg)
+                remaining_tokens -= msg_tokens
+            else:
+                break
+
+        return compressed
+
+    def _compress_semantically(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int
+    ) -> List[Dict[str, str]]:
+        """
+        Advanced compression: Keep semantically important messages.
+        Uses embeddings to identify and preserve high-value content.
+        """
+        # Keep system messages
+        system_msgs = [m for m in messages if m["role"] == "system"]
+        other_msgs = [m for m in messages if m["role"] != "system"]
+
+        if len(other_msgs) <= 3:
+            # Too few messages, use simple compression
+            return self._compress_by_recency(messages, max_tokens)
+
+        # Generate embeddings for all messages
+        embeddings = self._get_embeddings([m["content"] for m in other_msgs])
+
+        # Calculate importance scores
+        scores = self._calculate_importance_scores(other_msgs, embeddings)
+
+        # Select messages to keep based on scores
+        compressed = system_msgs.copy()
+        remaining_tokens = max_tokens - sum(
+            self.count_tokens(m["content"]) for m in system_msgs
+        )
+
+        # Sort by importance score (descending)
+        sorted_indices = np.argsort(scores)[::-1]
+
+        for idx in sorted_indices:
+            msg = other_msgs[idx]
+            msg_tokens = self.count_tokens(msg["content"])
+
+            if msg_tokens <= remaining_tokens:
+                compressed.append(msg)
+                remaining_tokens -= msg_tokens
+
+        # Re-sort by original order to maintain conversation flow
+        compressed = sorted(compressed, key=lambda m: messages.index(m))
+
+        return compressed
+
+    def _get_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Generate embeddings for semantic similarity."""
+        inputs = self.embeddings_tokenizer(
+            texts, padding=True, truncation=True, return_tensors="pt"
+        )
+
+        with torch.no_grad():
+            outputs = self.embeddings_model(**inputs)
+
+        # Mean pooling
+        embeddings = outputs.last_hidden_state.mean(dim=1)
+        return embeddings.numpy()
+
+    def _calculate_importance_scores(
+        self,
+        messages: List[Dict[str, str]],
+        embeddings: np.ndarray
+    ) -> np.ndarray:
+        """Calculate importance score for each message."""
+        n = len(messages)
+        scores = np.zeros(n)
+
+        # Recency score
+        recency_weight = 0.4
+        for i in range(n):
+            position_ratio = i / max(n - 1, 1)
+            scores[i] += recency_weight * np.exp(position_ratio)
+
+        # Uniqueness score
+        uniqueness_weight = 0.4
+        similarity_matrix = cosine_similarity(embeddings)
+        for i in range(n):
+            avg_similarity = (similarity_matrix[i].sum() - 1) / max(n - 1, 1)
+            scores[i] += uniqueness_weight * (1 - avg_similarity)
+
+        # Position score (first and last are important)
+        position_weight = 0.2
+        for i in range(n):
+            if i == 0 or i == n - 1:
+                scores[i] += position_weight * 1.0
+
+        return scores</code></pre>
+
+            <h4>Semantic Caching</h4>
+
+            <p>Semantic caching stores responses for semantically similar queries, dramatically reducing API calls for common questions. Unlike exact-match caching, semantic caching uses embeddings to identify similar queries even with different wording.</p>
+
+            <pre><code class="language-python line-numbers">import hashlib
+import json
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+
+class SemanticCache:
+    """
+    Semantic caching system using embeddings.
+    Caches responses for similar queries to reduce API calls.
+    """
+
+    def __init__(
+        self,
+        similarity_threshold: float = 0.92,
+        max_cache_size: int = 10000,
+        ttl_hours: int = 24,
+        embedding_model: Any = None
+    ):
+        self.similarity_threshold = similarity_threshold
+        self.max_cache_size = max_cache_size
+        self.ttl = timedelta(hours=ttl_hours)
+
+        # Cache storage
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.query_embeddings: Dict[str, np.ndarray] = {}
+
+        # Embedding model
+        self.embedding_model = embedding_model or self._init_embedding_model()
+
+        # Statistics
+        self.stats = {"hits": 0, "misses": 0, "evictions": 0}
+
+    def _init_embedding_model(self):
+        """Initialize lightweight embedding model."""
+        from sentence_transformers import SentenceTransformer
+        return SentenceTransformer('all-MiniLM-L6-v2')
+
+    def get(self, query: str, context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """Retrieve cached response for query using semantic similarity."""
+        # Try exact match first (O(1))
+        cache_key = self._create_cache_key(query, context)
+        if cache_key in self.cache:
+            entry = self.cache[cache_key]
+            if self._is_valid(entry):
+                self.stats["hits"] += 1
+                return entry["response"]
+
+        # Try semantic match
+        query_embedding = self.embedding_model.encode([query])[0]
+        best_similarity = 0.0
+        best_match_key = None
+
+        for key, embedding in self.query_embeddings.items():
+            if key not in self.cache:
+                continue
+
+            entry = self.cache[key]
+            if not self._is_valid(entry):
+                continue
+
+            similarity = cosine_similarity([query_embedding], [embedding])[0][0]
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match_key = key
+
+        if best_similarity >= self.similarity_threshold:
+            self.stats["hits"] += 1
+            return self.cache[best_match_key]["response"]
+
+        self.stats["misses"] += 1
+        return None
+
+    def set(self, query: str, response: Dict[str, Any], context: Optional[Dict[str, Any]] = None):
+        """Store response in cache."""
+        if len(self.cache) >= self.max_cache_size:
+            self._evict_oldest()
+
+        cache_key = self._create_cache_key(query, context)
+        query_embedding = self.embedding_model.encode([query])[0]
+
+        self.cache[cache_key] = {
+            "query": query,
+            "response": response,
+            "context": context,
+            "timestamp": datetime.now(),
+            "access_count": 0
+        }
+        self.query_embeddings[cache_key] = query_embedding
+
+    def _create_cache_key(self, query: str, context: Optional[Dict[str, Any]] = None) -> str:
+        """Create cache key from query and context."""
+        key_data = {"query": query, "context": context or {}}
+        key_string = json.dumps(key_data, sort_keys=True)
+        return hashlib.sha256(key_string.encode()).hexdigest()
+
+    def _is_valid(self, entry: Dict[str, Any]) -> bool:
+        """Check if cache entry is still valid."""
+        age = datetime.now() - entry["timestamp"]
+        return age < self.ttl
+
+    def _evict_oldest(self):
+        """Evict least recently used entries."""
+        sorted_keys = sorted(
+            self.cache.keys(),
+            key=lambda k: (self.cache[k]["access_count"], self.cache[k]["timestamp"])
+        )
+        num_to_evict = max(1, len(sorted_keys) // 10)
+        for key in sorted_keys[:num_to_evict]:
+            del self.cache[key]
+            if key in self.query_embeddings:
+                del self.query_embeddings[key]
+            self.stats["evictions"] += 1
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        total_requests = self.stats["hits"] + self.stats["misses"]
+        hit_rate = self.stats["hits"] / total_requests if total_requests > 0 else 0
+        return {**self.stats, "total_requests": total_requests, "hit_rate": hit_rate, "cache_size": len(self.cache)}</code></pre>
+
+            <div class="callout tip">
+              <div class="callout-title">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4M12 8h.01"></path></svg>
+                Best Practice: Layered Optimization
+              </div>
+              <div class="callout-content">
+                <p>Combine multiple token optimization strategies for maximum effect. Start with semantic caching for common queries (70-80% hit rate achievable), add request deduplication for concurrent requests (10-15% savings), and use prompt compression for long conversations (30-50% reduction). This layered approach can reduce token costs by 60-70% overall.</p>
+              </div>
+            </div>
+
+          </article>
+
+          <article class="subsection" id="caching-strategies">
+            <h3>11.2 Model Routing for Cost</h3>
+
+            <p>Intelligent model routing directs queries to the most cost-effective model capable of handling them. By using cheaper models for simple queries and reserving expensive models for complex tasks, you can achieve significant cost savings without compromising quality.</p>
+
+            <h4>Cost-Aware Routing Architecture</h4>
+
+            <div class="table-wrapper">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Model Tier</th>
+                    <th>Example Models</th>
+                    <th>Cost per 1M Tokens</th>
+                    <th>Latency (p95)</th>
+                    <th>Best For</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><strong>Ultra-cheap</strong></td>
+                    <td>GPT-3.5-turbo, Claude Instant</td>
+                    <td>$0.50 - $1.50</td>
+                    <td>200-400ms</td>
+                    <td>FAQs, simple classification, fact lookup</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Standard</strong></td>
+                    <td>GPT-4, Claude 3 Sonnet</td>
+                    <td>$3 - $15</td>
+                    <td>1-2s</td>
+                    <td>General conversation, analysis, summarization</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Premium</strong></td>
+                    <td>GPT-4-turbo, Claude 3 Opus</td>
+                    <td>$10 - $30</td>
+                    <td>2-4s</td>
+                    <td>Complex reasoning, code generation, long context</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Ultra-premium</strong></td>
+                    <td>GPT-4-32k, Claude 3.5 Opus</td>
+                    <td>$60 - $150</td>
+                    <td>5-10s</td>
+                    <td>Extended context, document analysis, multi-step reasoning</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p>A production chatbot handling 100,000 daily queries achieved 68% cost reduction by implementing intelligent routing. Simple queries (42% of traffic) were routed to GPT-3.5-turbo, standard queries (33%) to GPT-4, and complex queries (25%) to GPT-4-turbo. This reduced monthly costs from $12,000 to $3,840 while maintaining 98% user satisfaction scores.</p>
+
+          </article>
+
+          <article class="subsection" id="cost-modeling">
+            <h3>11.3 Hybrid Architecture</h3>
+
+            <p>Hybrid architectures combine cloud-based and self-hosted models to optimize costs, latency, and data privacy. This approach routes sensitive or high-volume queries to self-hosted models while using cloud APIs for complex tasks requiring cutting-edge capabilities.</p>
+
+            <h4>Decision Framework</h4>
+
+            <div class="table-wrapper">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Factor</th>
+                    <th>Cloud Models</th>
+                    <th>Self-Hosted Models</th>
+                    <th>Hybrid Best Practice</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><strong>Cost at Scale</strong></td>
+                    <td>High variable cost ($5-15K/month at 1M queries)</td>
+                    <td>Lower after break-even (~$2-3K/month fixed)</td>
+                    <td>Route high-volume to self-hosted</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Model Quality</strong></td>
+                    <td>State-of-the-art (GPT-4, Claude 3)</td>
+                    <td>Good (Llama 2, Mistral, Falcon)</td>
+                    <td>Complex queries to cloud</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Latency</strong></td>
+                    <td>200-2000ms (network dependent)</td>
+                    <td>50-500ms (local inference)</td>
+                    <td>Latency-sensitive to self-hosted</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Data Privacy</strong></td>
+                    <td>Data leaves your infrastructure</td>
+                    <td>Complete control</td>
+                    <td>Sensitive data to self-hosted only</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="callout tip">
+              <div class="callout-title">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4M12 8h.01"></path></svg>
+                Implementation Strategy
+              </div>
+              <div class="callout-content">
+                <p>Start with cloud-only deployment for simplicity. Once you reach 500K-1M queries/month, evaluate self-hosting for cost savings. Implement hybrid routing gradually: begin by routing only sensitive data queries to self-hosted infrastructure, then expand to simple queries as you gain operational confidence. This phased approach minimizes risk while capturing cost benefits.</p>
+              </div>
+            </div>
+
+          </article>
+
+          <article class="subsection" id="model-selection">
+            <h3>11.4 ROI Analysis</h3>
+
+            <p>Comprehensive ROI analysis tracks every dollar spent on LLM operations and measures the value delivered. This enables data-driven optimization decisions and demonstrates business impact to stakeholders.</p>
+
+            <h4>Cost Tracking Implementation</h4>
+
+            <p>Detailed cost tracking captures spend across models, users, features, and time periods. This granular data enables precise optimization targeting.</p>
+
+            <pre><code class="language-python line-numbers">from datetime import datetime, timedelta
+from typing import Dict, Any, List
+from dataclasses import dataclass, asdict
+import json
+
+@dataclass
+class CostEvent:
+    """Represents a single cost-incurring event."""
+    timestamp: datetime
+    user_id: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    latency_ms: int
+    feature: str
+    success: bool
+    cached: bool = False
+
+class CostTracker:
+    """Comprehensive cost tracking for LLM operations."""
+
+    def __init__(self, storage_backend: Any):
+        self.storage = storage_backend
+
+        # Model pricing (update regularly)
+        self.pricing = {
+            "gpt-4": {"input": 0.03 / 1000, "output": 0.06 / 1000},
+            "gpt-3.5-turbo": {"input": 0.0005 / 1000, "output": 0.0015 / 1000},
+            "claude-3-opus": {"input": 0.015 / 1000, "output": 0.075 / 1000}
+        }
+
+    def record_event(
+        self, user_id: str, model: str, input_tokens: int,
+        output_tokens: int, latency_ms: int, feature: str,
+        success: bool, cached: bool = False
+    ) -> CostEvent:
+        """Record a cost event."""
+        model_pricing = self.pricing.get(model, {})
+        cost_usd = (
+            (input_tokens * model_pricing.get("input", 0)) +
+            (output_tokens * model_pricing.get("output", 0))
+        )
+
+        event = CostEvent(
+            timestamp=datetime.utcnow(),
+            user_id=user_id,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
+            latency_ms=latency_ms,
+            feature=feature,
+            success=success,
+            cached=cached
+        )
+
+        self.storage.save(asdict(event))
+        return event
+
+    def get_costs_by_feature(
+        self, start_date: datetime, end_date: datetime
+    ) -> Dict[str, Dict[str, Any]]:
+        """Get cost attribution by feature."""
+        events = self.storage.query(start_date, end_date)
+
+        feature_costs = {}
+        for event in events:
+            feature = event["feature"]
+            if feature not in feature_costs:
+                feature_costs[feature] = {
+                    "total_cost": 0,
+                    "request_count": 0,
+                    "total_tokens": 0
+                }
+
+            feature_costs[feature]["total_cost"] += event["cost_usd"]
+            feature_costs[feature]["request_count"] += 1
+            feature_costs[feature]["total_tokens"] += (
+                event["input_tokens"] + event["output_tokens"]
+            )
+
+        return feature_costs</code></pre>
+
+            <h4>Example ROI Results</h4>
+
+            <p>A B2B SaaS company implementing comprehensive cost tracking discovered their customer support chatbot was generating $45,000/month in value (measured by support tickets resolved and time saved) while costing $3,200/month to operate, achieving a 1,306% ROI. After implementing optimization recommendations (caching and model routing), costs dropped to $1,400/month while maintaining the same value delivery, increasing ROI to 3,114%.</p>
+
+            <div class="callout warning">
+              <div class="callout-title">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+                Common Pitfall: Optimizing Without Measuring
+              </div>
+              <div class="callout-content">
+                <p>Many teams optimize costs without measuring impact on quality or value delivered. This can lead to degraded user experience and reduced ROI despite lower costs. Always track quality metrics (user satisfaction, task completion rate, accuracy) alongside cost metrics. A 50% cost reduction that causes 20% drop in satisfaction may actually reduce overall business value.</p>
+              </div>
+            </div>
+
+          </article>
+        </section>

@@ -1,0 +1,779 @@
+        <!-- Section 9: Infrastructure & DevOps -->
+        <section class="section" id="infrastructure">
+          <h2>9. Infrastructure and DevOps</h2>
+
+          <p>Deploying LLM chatbot applications to production requires careful consideration of containerization, orchestration, continuous integration, and infrastructure provisioning. This section provides comprehensive guidance on building production-ready deployment pipelines that ensure reliability, scalability, and maintainability.</p>
+
+          <!-- Section 9.1: Containerization -->
+          <article class="subsection" id="containerization">
+            <h3>9.1 Containerization</h3>
+
+            <p>Containerization is the foundation of modern cloud-native deployments. For LLM chatbot applications, proper containerization ensures consistent environments across development, staging, and production while optimizing for the unique requirements of AI workloads.</p>
+
+            <h4>Dockerfile Best Practices</h4>
+
+            <ul>
+              <li><strong>Use specific base image tags</strong> - Never use <code>latest</code>; pin to specific versions</li>
+              <li><strong>Leverage multi-stage builds</strong> - Separate build dependencies from runtime</li>
+              <li><strong>Order instructions by change frequency</strong> - Maximize layer caching</li>
+              <li><strong>Use non-root users</strong> - Run applications as unprivileged users</li>
+              <li><strong>Minimize layers</strong> - Combine related RUN commands</li>
+            </ul>
+
+            <h4>Production Multi-Stage Dockerfile</h4>
+
+<pre><code class="language-dockerfile"># Stage 1: Builder
+FROM python:3.11-slim-bookworm AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+    build-essential curl git \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /build
+COPY requirements.txt requirements-prod.txt ./
+RUN pip install --upgrade pip &amp;&amp; \
+    pip install -r requirements.txt -r requirements-prod.txt
+
+COPY . .
+RUN pip install build &amp;&amp; python -m build --wheel --outdir /build/dist
+
+# Stage 2: Production
+FROM python:3.11-slim-bookworm AS production
+
+LABEL maintainer="devops@company.com" \
+      version="1.0.0" \
+      description="LLM Chatbot API Service"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    APP_HOME=/app \
+    APP_USER=appuser \
+    PATH="/opt/venv/bin:$PATH"
+
+RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends \
+    curl libpq5 ca-certificates \
+    &amp;&amp; rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 1000 appgroup &amp;&amp; \
+    useradd --uid 1000 --gid appgroup --create-home ${APP_USER}
+
+COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR ${APP_HOME}
+COPY --chown=${APP_USER}:appgroup ./app ./app
+COPY --chown=${APP_USER}:appgroup ./scripts/entrypoint.sh ./
+
+RUN chmod +x entrypoint.sh &amp;&amp; \
+    mkdir -p /app/logs /app/tmp &amp;&amp; \
+    chown -R ${APP_USER}:appgroup /app
+
+USER ${APP_USER}
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl --fail http://localhost:8000/health || exit 1
+
+ENTRYPOINT ["./entrypoint.sh"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]</code></pre>
+
+            <h4>Docker Compose for Development</h4>
+
+<pre><code class="language-yaml">version: '3.9'
+
+services:
+  app:
+    build:
+      context: .
+      target: production
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/chatbot
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key}
+    volumes:
+      - ./app:/app/app:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=chatbot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 256mb
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:</code></pre>
+
+            <h4>Image Optimization</h4>
+
+            <div class="table-wrapper">
+              <table>
+                <thead>
+                  <tr><th>Technique</th><th>Impact</th><th>Implementation</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Slim variants</td><td>40-50% reduction</td><td><code>python:3.11-slim-bookworm</code></td></tr>
+                  <tr><td>Multi-stage builds</td><td>50-70% reduction</td><td>Separate build/runtime stages</td></tr>
+                  <tr><td>No cache pip</td><td>10-30% reduction</td><td><code>pip install --no-cache-dir</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+
+          <!-- Section 9.2: Kubernetes Deployment -->
+          <article class="subsection" id="kubernetes-deployment">
+            <h3>9.2 Kubernetes Deployment</h3>
+
+            <p>Kubernetes provides orchestration for running containerized LLM chatbot applications at scale with deployment manifests, autoscaling, and security policies.</p>
+
+            <h4>Kubernetes Architecture</h4>
+
+            <svg viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg" style="max-width: 100%; height: auto; margin: 2rem 0; background: #f8fafc; border-radius: 8px;">
+              <rect x="20" y="20" width="760" height="260" fill="none" stroke="#326CE5" stroke-width="2" stroke-dasharray="8,4" rx="8"/>
+              <text x="40" y="45" font-family="Inter, sans-serif" font-size="12" font-weight="600" fill="#326CE5">Kubernetes Cluster</text>
+              <rect x="320" y="55" width="160" height="35" fill="#326CE5" rx="4"/>
+              <text x="400" y="77" font-family="Inter, sans-serif" font-size="11" font-weight="600" fill="white" text-anchor="middle">Ingress</text>
+              <rect x="300" y="105" width="200" height="35" fill="#7C3AED" rx="4"/>
+              <text x="400" y="127" font-family="Inter, sans-serif" font-size="11" font-weight="600" fill="white" text-anchor="middle">Service</text>
+              <rect x="550" y="105" width="80" height="35" fill="#F59E0B" rx="4"/>
+              <text x="590" y="127" font-family="Inter, sans-serif" font-size="10" fill="white" text-anchor="middle">HPA</text>
+              <rect x="60" y="155" width="680" height="70" fill="#E0E7FF" rx="6" stroke="#6366F1"/>
+              <text x="80" y="175" font-family="Inter, sans-serif" font-size="11" font-weight="600" fill="#4338CA">Deployment (replicas: 3)</text>
+              <rect x="80" y="185" width="200" height="30" fill="#4CAF50" rx="4"/>
+              <text x="180" y="205" font-family="Inter, sans-serif" font-size="10" fill="white" text-anchor="middle">Pod 1</text>
+              <rect x="300" y="185" width="200" height="30" fill="#4CAF50" rx="4"/>
+              <text x="400" y="205" font-family="Inter, sans-serif" font-size="10" fill="white" text-anchor="middle">Pod 2</text>
+              <rect x="520" y="185" width="200" height="30" fill="#4CAF50" rx="4"/>
+              <text x="620" y="205" font-family="Inter, sans-serif" font-size="10" fill="white" text-anchor="middle">Pod 3</text>
+              <rect x="80" y="240" width="100" height="30" fill="#EF4444" rx="4"/>
+              <text x="130" y="260" font-family="Inter, sans-serif" font-size="10" fill="white" text-anchor="middle">PostgreSQL</text>
+              <rect x="200" y="240" width="80" height="30" fill="#EF4444" rx="4"/>
+              <text x="240" y="260" font-family="Inter, sans-serif" font-size="10" fill="white" text-anchor="middle">Redis</text>
+              <rect x="300" y="240" width="80" height="30" fill="#EF4444" rx="4"/>
+              <text x="340" y="260" font-family="Inter, sans-serif" font-size="10" fill="white" text-anchor="middle">Qdrant</text>
+            </svg>
+
+            <h4>Deployment Manifest</h4>
+
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chatbot-api
+  namespace: chatbot
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: chatbot-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: chatbot-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: chatbot-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: chatbot-api
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: chatbot-api
+          image: gcr.io/project-id/chatbot-api:v1.2.3
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: chatbot-config
+            - secretRef:
+                name: chatbot-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}</code></pre>
+
+            <h4>Service, Ingress, and HPA</h4>
+
+<pre><code class="language-yaml"># Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: chatbot-api
+  namespace: chatbot
+spec:
+  type: ClusterIP
+  selector:
+    app: chatbot-api
+  ports:
+    - port: 80
+      targetPort: http
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chatbot-api
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [api.example.com]
+      secretName: chatbot-api-tls
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: chatbot-api
+                port:
+                  number: 80
+
+---
+# HPA
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chatbot-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: chatbot-api
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 0</code></pre>
+
+            <h4>ConfigMap, Secrets, Network Policy</h4>
+
+<pre><code class="language-yaml"># ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chatbot-config
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  LLM_REQUEST_TIMEOUT: "120"
+
+---
+# Secret (use external-secrets in production)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: chatbot-secrets
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql://user:pass@postgres:5432/chatbot"
+  OPENAI_API_KEY: "sk-..."
+
+---
+# NetworkPolicy
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: chatbot-api-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: chatbot-api
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - port: 8000
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8]
+      ports:
+        - port: 443
+
+---
+# PodDisruptionBudget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: chatbot-api-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: chatbot-api</code></pre>
+          </article>
+
+          <!-- Section 9.3: CI/CD Pipelines -->
+          <article class="subsection" id="ci-cd-pipelines">
+            <h3>9.3 CI/CD Pipelines</h3>
+
+            <p>Continuous Integration and Continuous Deployment pipelines automate build, test, and deployment processes for reliable software delivery.</p>
+
+            <h4>GitHub Actions Workflow</h4>
+
+<pre><code class="language-yaml">name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: gcr.io
+  IMAGE_NAME: ${{ secrets.GCP_PROJECT_ID }}/chatbot-api
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_chatbot
+        ports: ["5432:5432"]
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: ruff check . &amp;&amp; mypy app
+      - run: pytest tests -v --cov=app
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test_chatbot
+          REDIS_URL: redis://localhost:6379/0
+      - uses: codecov/codecov-action@v3
+
+  security:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          severity: 'CRITICAL,HIGH'
+
+  build:
+    needs: [test, security]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - run: gcloud auth configure-docker gcr.io
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+      - uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/get-gke-credentials@v1
+        with:
+          cluster_name: staging-cluster
+          location: us-central1
+      - run: |
+          kubectl set image deployment/chatbot-api \
+            chatbot-api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }} \
+            -n chatbot-staging
+          kubectl rollout status deployment/chatbot-api -n chatbot-staging
+
+  deploy-production:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_PROD }}
+      - uses: google-github-actions/get-gke-credentials@v1
+        with:
+          cluster_name: prod-cluster
+          location: us-central1
+      - run: |
+          # Canary deployment
+          kubectl set image deployment/chatbot-api-canary \
+            chatbot-api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }} \
+            -n chatbot-prod
+          sleep 300
+          # Full rollout
+          kubectl set image deployment/chatbot-api \
+            chatbot-api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }} \
+            -n chatbot-prod
+          kubectl rollout status deployment/chatbot-api -n chatbot-prod</code></pre>
+
+            <h4>ArgoCD Application</h4>
+
+<pre><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: chatbot-api
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/company/chatbot-api.git
+    targetRevision: HEAD
+    path: charts/chatbot-api
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: chatbot-prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true</code></pre>
+
+            <h4>Rollback Script</h4>
+
+<pre><code class="language-bash">#!/bin/bash
+set -euo pipefail
+
+NAMESPACE=${NAMESPACE:-chatbot-prod}
+DEPLOYMENT=${DEPLOYMENT:-chatbot-api}
+REVISION=${1:-}
+
+echo "=== Rollback ==="
+kubectl rollout history deployment/$DEPLOYMENT -n $NAMESPACE
+
+if [ -z "$REVISION" ]; then
+    kubectl rollout undo deployment/$DEPLOYMENT -n $NAMESPACE
+else
+    kubectl rollout undo deployment/$DEPLOYMENT -n $NAMESPACE --to-revision=$REVISION
+fi
+
+kubectl rollout status deployment/$DEPLOYMENT -n $NAMESPACE --timeout=300s
+echo "=== Complete ==="</code></pre>
+          </article>
+
+          <!-- Section 9.4: Infrastructure as Code -->
+          <article class="subsection" id="infrastructure-as-code">
+            <h3>9.4 Infrastructure as Code</h3>
+
+            <p>Infrastructure as Code (IaC) enables reproducible, version-controlled infrastructure provisioning using Terraform.</p>
+
+            <h4>GKE Cluster Module</h4>
+
+<pre><code class="language-bash"># terraform/modules/gke-cluster/main.tf
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+resource "google_container_cluster" "primary" {
+  name     = var.cluster_name
+  location = var.region
+  node_locations = var.node_zones
+
+  remove_default_node_pool = true
+  initial_node_count       = 1
+
+  network    = var.vpc_network
+  subnetwork = var.vpc_subnetwork
+
+  private_cluster_config {
+    enable_private_nodes    = true
+    enable_private_endpoint = false
+    master_ipv4_cidr_block  = var.master_ipv4_cidr
+  }
+
+  workload_identity_config {
+    workload_pool = "${var.project_id}.svc.id.goog"
+  }
+
+  addons_config {
+    http_load_balancing { disabled = false }
+    horizontal_pod_autoscaling { disabled = false }
+  }
+
+  release_channel { channel = "REGULAR" }
+  enable_shielded_nodes = true
+}
+
+resource "google_container_node_pool" "app" {
+  name     = "app-pool"
+  location = var.region
+  cluster  = google_container_cluster.primary.name
+
+  autoscaling {
+    min_node_count = var.min_nodes
+    max_node_count = var.max_nodes
+  }
+
+  management {
+    auto_repair  = true
+    auto_upgrade = true
+  }
+
+  node_config {
+    machine_type = var.machine_type
+    disk_size_gb = 100
+    disk_type    = "pd-ssd"
+    oauth_scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config { mode = "GKE_METADATA" }
+    shielded_instance_config {
+      enable_secure_boot          = true
+      enable_integrity_monitoring = true
+    }
+  }
+}
+
+output "cluster_name" { value = google_container_cluster.primary.name }
+output "cluster_endpoint" { value = google_container_cluster.primary.endpoint }</code></pre>
+
+            <h4>Cloud SQL Module</h4>
+
+<pre><code class="language-bash"># terraform/modules/cloudsql/main.tf
+resource "google_sql_database_instance" "main" {
+  name             = var.instance_name
+  database_version = "POSTGRES_15"
+  region           = var.region
+  deletion_protection = var.deletion_protection
+
+  settings {
+    tier              = var.tier
+    availability_type = var.ha ? "REGIONAL" : "ZONAL"
+    disk_size         = var.disk_size
+    disk_type         = "PD_SSD"
+    disk_autoresize   = true
+
+    backup_configuration {
+      enabled                        = true
+      point_in_time_recovery_enabled = true
+    }
+
+    ip_configuration {
+      ipv4_enabled    = false
+      private_network = var.vpc_network
+      require_ssl     = true
+    }
+
+    database_flags {
+      name  = "max_connections"
+      value = "500"
+    }
+  }
+}
+
+resource "google_sql_database" "db" {
+  name     = "chatbot"
+  instance = google_sql_database_instance.main.name
+}
+
+resource "google_sql_user" "user" {
+  name     = var.db_user
+  instance = google_sql_database_instance.main.name
+  password = var.db_password
+}
+
+output "connection_name" { value = google_sql_database_instance.main.connection_name }</code></pre>
+
+            <h4>Main Configuration</h4>
+
+<pre><code class="language-bash"># terraform/environments/production/main.tf
+terraform {
+  required_version = ">= 1.5.0"
+  backend "gcs" {
+    bucket = "chatbot-terraform-state"
+    prefix = "production"
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+module "vpc" {
+  source       = "../../modules/vpc"
+  project_id   = var.project_id
+  network_name = "chatbot-vpc"
+  region       = var.region
+}
+
+module "gke" {
+  source         = "../../modules/gke-cluster"
+  project_id     = var.project_id
+  cluster_name   = "chatbot-prod"
+  region         = var.region
+  node_zones     = ["us-central1-a", "us-central1-b"]
+  vpc_network    = module.vpc.network_self_link
+  vpc_subnetwork = module.vpc.subnet_self_link
+  min_nodes      = 2
+  max_nodes      = 20
+  machine_type   = "e2-standard-4"
+}
+
+module "cloudsql" {
+  source        = "../../modules/cloudsql"
+  instance_name = "chatbot-prod"
+  region        = var.region
+  tier          = "db-custom-4-16384"
+  disk_size     = 100
+  ha            = true
+  vpc_network   = module.vpc.network_self_link
+  db_user       = var.db_user
+  db_password   = var.db_password
+}
+
+module "redis" {
+  source         = "../../modules/memorystore"
+  instance_name  = "chatbot-prod"
+  region         = var.region
+  memory_size_gb = 4
+  ha             = true
+  vpc_network    = module.vpc.network_self_link
+}
+
+output "gke_cluster" { value = module.gke.cluster_name }
+output "db_connection" { value = module.cloudsql.connection_name }</code></pre>
+
+            <div class="callout info">
+              <div class="callout-title">State Management</div>
+              <div class="callout-content">
+                <p>Always use remote state backends with locking enabled. Enable versioning on your state bucket and use separate state files for different environments.</p>
+              </div>
+            </div>
+          </article>
+
+        </section>
